@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+experiments/results/*.png
+experiments/results/*.txt
+agents/*.pkl
+notebooks/.ipynb_checkpoints/
