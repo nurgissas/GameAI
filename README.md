@@ -1,6 +1,6 @@
 # Adaptive Difficulty Scaling with Reinforcement Learning
 
-**Team 13** — Nurgissa (20210785), Youngjin Cho (20190627)
+Nurgissa Sailaubek, Youngjin Cho
 
 A two-stage game AI system that dynamically adjusts opponent difficulty in real time based on how well the player is actually playing — not just whether they win or lose. The system estimates player skill from the quality of their moves and uses a learned Q-Learning controller to decide when to increase, hold, or decrease difficulty.
 
