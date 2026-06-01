@@ -1,89 +1,82 @@
-"""Hyperparameter sensitivity analysis for Q-Learning agent"""
+"""Hyperparameter sensitivity analysis for MNK linear FA agents."""
 
+import argparse
 import sys
 import os
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import random
-from envs.tictactoe import TicTacToeGame
-from rl_training.q_learning_agent import QLearningAgent
+from envs.mnk_game import MNKGame, OPPONENT, PLAYER, RandomPolicy, _check_winner, legal_moves
+from rl_training.mnk_q_agent import MNKQLearningAgent
 
 
-def train_and_evaluate(lr, gamma, epsilon, num_episodes=15000, eval_games=200):
-    agent = QLearningAgent(learning_rate=lr, discount_factor=gamma, epsilon=epsilon)
-    game = TicTacToeGame()
+def train_and_evaluate(
+    lr: float,
+    gamma: float,
+    epsilon: float,
+    n: int = 3,
+    k: int = 3,
+    num_episodes: int = 15_000,
+    eval_games: int = 200,
+) -> float:
+    game = MNKGame(n, n, k)
+    agent = MNKQLearningAgent(learning_rate=lr, discount_factor=gamma, epsilon=epsilon)
+    rand = RandomPolicy()
 
-    for episode in range(num_episodes):
-        game.reset()
+    for _ in range(num_episodes):
+        agent.train_episode(game)
 
-        while True:
-            state = game.get_state()
-            valid_moves = game.get_valid_moves()
-            action = agent.choose_action(state, valid_moves, training=True)
-            game.make_move(action)
-
-            winner = game.get_winner()
-            if winner:
-                if winner == 'X':
-                    reward, key = 1.0, 'wins'
-                elif winner == 'Draw':
-                    reward, key = 0.0, 'draws'
-                else:
-                    reward, key = -1.0, 'losses'
-
-                agent.update_q_value(state, action, reward, game.get_state(), [])
-                agent.training_stats[key] += 1
-                agent.training_stats['episodes'] += 1
-                break
-
-            valid_moves = game.get_valid_moves()
-            game.make_move(random.choice(valid_moves))
-            if game.get_winner():
-                break
-
-    # Evaluate
     agent.epsilon = 0.0
     wins = 0
-    for _ in range(eval_games):
-        game.reset()
+
+    for i in range(eval_games):
+        board = [[0] * n for _ in range(n)]
+        agent_marker = PLAYER if i % 2 == 0 else OPPONENT
+        enemy_marker = -agent_marker
+        current = PLAYER
         while True:
-            state = game.get_state()
-            valid_moves = game.get_valid_moves()
-            action = agent.choose_action(state, valid_moves, training=False)
-            game.make_move(action)
-            winner = game.get_winner()
-            if winner:
-                if winner == 'X':
+            moves = legal_moves(board)
+            if not moves:
+                break
+            if current == agent_marker:
+                move = agent.choose_move(board, agent_marker, enemy_marker, k)
+            else:
+                move = rand.choose_move(board, current, -current, k)
+            board[move[0]][move[1]] = current
+            if _check_winner(board, n, n, k, move, current):
+                if current == agent_marker:
                     wins += 1
                 break
-            valid_moves = game.get_valid_moves()
-            if valid_moves:
-                game.make_move(random.choice(valid_moves))
-            if game.get_winner():
-                break
+            current = -current
 
     return wins / eval_games
 
 
 if __name__ == "__main__":
-    learning_rates = [0.05, 0.1, 0.2, 0.5]
-    discount_factors = [0.9, 0.95, 0.99]
-    epsilons = [0.1, 0.2, 0.3, 0.5]
+    parser = argparse.ArgumentParser(
+        description="Sweep hyperparameters for the MNK linear FA agent."
+    )
+    parser.add_argument("--n", type=int, default=3)
+    parser.add_argument("--k", type=int, default=3)
+    args = parser.parse_args()
 
-    print("Sensitivity Analysis: Learning Rate")
-    print("-" * 40)
-    for lr in learning_rates:
-        win_rate = train_and_evaluate(lr=lr, gamma=0.99, epsilon=0.3)
-        print(f"  lr={lr:.2f}: {win_rate:.1%} win rate")
+    n, k = args.n, args.k
+    print(f"Sensitivity analysis on MNK({n},{n},{k})")
 
-    print("\nSensitivity Analysis: Discount Factor")
+    print("\nLearning Rate  (gamma=0.99, epsilon=0.3)")
     print("-" * 40)
-    for gamma in discount_factors:
-        win_rate = train_and_evaluate(lr=0.1, gamma=gamma, epsilon=0.3)
-        print(f"  gamma={gamma}: {win_rate:.1%} win rate")
+    for lr in [0.01, 0.05, 0.1, 0.2]:
+        wr = train_and_evaluate(lr=lr, gamma=0.99, epsilon=0.3, n=n, k=k)
+        print(f"  lr={lr:.2f}: {wr:.1%}")
 
-    print("\nSensitivity Analysis: Epsilon")
+    print("\nDiscount Factor  (lr=0.05, epsilon=0.3)")
     print("-" * 40)
-    for eps in epsilons:
-        win_rate = train_and_evaluate(lr=0.1, gamma=0.99, epsilon=eps)
-        print(f"  epsilon={eps}: {win_rate:.1%} win rate")
+    for gamma in [0.9, 0.95, 0.99]:
+        wr = train_and_evaluate(lr=0.05, gamma=gamma, epsilon=0.3, n=n, k=k)
+        print(f"  gamma={gamma}: {wr:.1%}")
+
+    print("\nEpsilon  (lr=0.05, gamma=0.99)")
+    print("-" * 40)
+    for eps in [0.1, 0.2, 0.3, 0.5]:
+        wr = train_and_evaluate(lr=0.05, gamma=0.99, epsilon=eps, n=n, k=k)
+        print(f"  epsilon={eps}: {wr:.1%}")
