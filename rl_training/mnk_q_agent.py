@@ -210,52 +210,93 @@ class MNKQLearningAgent:
 
 
 # ---------------------------------------------------------------------------
+# Epsilon-based difficulty pool
+# ---------------------------------------------------------------------------
+
+# Epsilon values for each difficulty level (index 0 = level 1 = easiest).
+# Level 1 plays almost randomly; level 5 always picks the greedy best move.
+EPSILON_LEVELS = [1.0, 0.7, 0.4, 0.15, 0.0]
+
+
+def build_opponent_pool(
+    path: str,
+    num_levels: int = 5,
+    epsilon_levels: list[float] | None = None,
+) -> list[MNKQLearningAgent]:
+    """
+    Load one trained agent and return `num_levels` copies with decreasing
+    epsilon values.
+
+    Difficulty is controlled entirely through epsilon rather than training
+    snapshots, which guarantees a monotonic gradient regardless of when the
+    weights converged during training.
+
+    Args:
+        path:          Path to the single trained .pkl file.
+        num_levels:    Number of difficulty levels to create.
+        epsilon_levels: Override the default EPSILON_LEVELS list.
+
+    Returns:
+        List of agents ordered from weakest (high ε) to strongest (ε=0).
+    """
+    if epsilon_levels is None:
+        if num_levels == len(EPSILON_LEVELS):
+            epsilon_levels = EPSILON_LEVELS
+        else:
+            # Evenly space from 1.0 down to 0.0
+            step = 1.0 / (num_levels - 1) if num_levels > 1 else 1.0
+            epsilon_levels = [round(1.0 - i * step, 4) for i in range(num_levels)]
+
+    pool = []
+    for eps in epsilon_levels:
+        agent = MNKQLearningAgent()
+        agent.load(path)
+        agent.epsilon = eps
+        pool.append(agent)
+    return pool
+
+
+# ---------------------------------------------------------------------------
 # Training helper
 # ---------------------------------------------------------------------------
 
-def train_mnk_agents(
+def train_mnk_agent(
     n: int = 3,
     k: int = 3,
-    num_episodes: int = 50_000,
-    num_levels: int = 5,
+    num_episodes: int = 30_000,
     save_dir: str = "agents",
     name: str = "mnk",
-) -> list[MNKQLearningAgent]:
+) -> MNKQLearningAgent:
     """
-    Train one agent continuously and save a snapshot every
-    (num_episodes // num_levels) episodes.
+    Train one agent to convergence and save it as a single .pkl file.
 
-    Each snapshot becomes one difficulty level for the opponent pool.
-    Epsilon decays linearly from 0.3 → 0.05 over training.
+    Epsilon decays linearly from 0.3 → 0.05 over training. Difficulty
+    levels are created at inference time via build_opponent_pool(), not
+    by saving multiple snapshots.
 
     Returns:
-        list of saved agents (level 1 = weakest, level N = strongest)
+        The trained agent.
     """
     game = MNKGame(n, n, k)
-    save_interval = num_episodes // num_levels
     agent = MNKQLearningAgent(learning_rate=0.05, epsilon=0.3)
-    saved = []
 
-    print(f"Training MNK({n},{n},{k}) for {num_episodes:,} episodes "
-          f"— saving {num_levels} levels every {save_interval:,} episodes")
+    print(f"Training MNK({n},{n},{k}) for {num_episodes:,} episodes")
     print("-" * 60)
 
+    log_interval = max(num_episodes // 5, 1)
     for episode in range(num_episodes):
-        progress = episode / num_episodes
-        agent.epsilon = 0.3 - 0.25 * progress
+        agent.epsilon = 0.3 - 0.25 * (episode / num_episodes)
         agent.train_episode(game)
 
-        if (episode + 1) % save_interval == 0:
-            level = (episode + 1) // save_interval
-            path = os.path.join(save_dir, f"{name}_{n}x{n}_k{k}_level_{level}.pkl")
-            agent.save(path)
-            print(f"  Level {level}/{num_levels} | Episode {episode + 1:,} | "
+        if (episode + 1) % log_interval == 0:
+            print(f"  Episode {episode + 1:,} / {num_episodes:,} | "
                   f"Win rate: {agent.win_rate():.1%}")
-            saved.append(agent)
 
+    path = os.path.join(save_dir, f"{name}_{n}x{n}_k{k}_trained.pkl")
+    agent.save(path)
     print("-" * 60)
-    print("Done.")
-    return saved
+    print(f"Done. Saved to {path}")
+    return agent
 
 
 # ---------------------------------------------------------------------------
