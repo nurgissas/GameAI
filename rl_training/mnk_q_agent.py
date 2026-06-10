@@ -42,17 +42,28 @@ class MNKQLearningAgent:
 
     def __init__(
         self,
-        learning_rate: float = 0.05,
+        learning_rate: float = 0.01,
         discount_factor: float = 0.99,
         epsilon: float = 0.3,
         seed: int | None = None,
+        td_clip: float = 5.0,
+        weight_clip: float = 10.0,
     ) -> None:
         self.weights = np.zeros(N_FEATURES, dtype=np.float64)
         self.alpha = learning_rate
         self.gamma = discount_factor
         self.epsilon = epsilon
+        self.td_clip = td_clip
+        self.weight_clip = weight_clip
         self._rng = random.Random(seed)
-        self.stats = {"wins": 0, "losses": 0, "draws": 0, "episodes": 0}
+        self.stats = {
+            "wins": 0,
+            "losses": 0,
+            "draws": 0,
+            "episodes": 0,
+            "clipped_updates": 0,
+            "skipped_updates": 0,
+        }
 
     # ------------------------------------------------------------------
     # Policy interface — called by MNKGame and QValueDifficultyEstimator
@@ -66,7 +77,10 @@ class MNKQLearningAgent:
         enemy_marker: int,
         k: int,
     ) -> float:
-        return float(np.dot(self.weights, extract(board, move, marker, k)))
+        value = float(np.dot(self.weights, extract(board, move, marker, k)))
+        if not np.isfinite(value):
+            return 0.0
+        return value
 
     def choose_move(
         self,
@@ -82,7 +96,7 @@ class MNKQLearningAgent:
         if self._rng.random() < self.epsilon:
             return self._rng.choice(moves)
 
-        return max(moves, key=lambda m: np.dot(self.weights, extract(board, m, marker, k)))
+        return max(moves, key=lambda m: self.q_value(board, m, marker, enemy_marker, k))
 
     # ------------------------------------------------------------------
     # Training
@@ -136,15 +150,14 @@ class MNKQLearningAgent:
                 # Update the previous agent step now that we can see the next state
                 if prev_phi is not None:
                     max_next_q = max(
-                        np.dot(self.weights, extract(board, m, agent_marker, game.k))
+                        self.q_value(board, m, agent_marker, enemy_marker, game.k)
                         for m in moves
                     )
-                    delta = self.gamma * float(max_next_q) - prev_q
-                    self.weights += self.alpha * delta * prev_phi
+                    self._td_update(prev_phi, prev_q, self.gamma * max_next_q)
 
                 move = self.choose_move(board, agent_marker, enemy_marker, game.k)
                 phi = extract(board, move, agent_marker, game.k)
-                prev_q = float(np.dot(self.weights, phi))
+                prev_q = self.q_value(board, move, agent_marker, enemy_marker, game.k)
                 prev_phi = phi
 
                 board[move[0]][move[1]] = agent_marker
@@ -181,18 +194,36 @@ class MNKQLearningAgent:
     # ------------------------------------------------------------------
 
     def save(self, path: str) -> None:
+        if not self.is_healthy():
+            raise ValueError("Refusing to save agent with non-finite weights.")
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
         with open(path, "wb") as f:
-            pickle.dump({"weights": self.weights, "stats": self.stats}, f)
+            pickle.dump(
+                {
+                    "weights": self.weights,
+                    "stats": self.stats,
+                    "alpha": self.alpha,
+                    "gamma": self.gamma,
+                    "td_clip": self.td_clip,
+                    "weight_clip": self.weight_clip,
+                },
+                f,
+            )
         print(f"Saved -> {path}  (non-zero weights: {np.count_nonzero(self.weights)})")
 
     def load(self, path: str) -> None:
         with open(path, "rb") as f:
             data = pickle.load(f)
-        self.weights = data["weights"]
+        self.weights = np.asarray(data["weights"], dtype=np.float64)
+        if not self.is_healthy():
+            raise ValueError(
+                f"Loaded model has non-finite weights and cannot be used: {path}"
+            )
         self.stats = data.get(
             "stats", {"wins": 0, "losses": 0, "draws": 0, "episodes": 0}
         )
+        self.stats.setdefault("clipped_updates", 0)
+        self.stats.setdefault("skipped_updates", 0)
         print(f"Loaded <- {path}")
 
     def win_rate(self) -> float:
@@ -204,9 +235,29 @@ class MNKQLearningAgent:
     # ------------------------------------------------------------------
 
     def _td_update(self, phi: np.ndarray, q: float, reward: float) -> None:
-        """Terminal update — no next state, so max Q(s') = 0."""
+        """Apply a bounded TD update and keep the weight vector finite."""
+        if not np.isfinite(q) or not np.isfinite(reward) or not np.all(np.isfinite(phi)):
+            self.stats["skipped_updates"] += 1
+            return
+
         delta = reward - q
-        self.weights += self.alpha * delta * phi
+        if not np.isfinite(delta):
+            self.stats["skipped_updates"] += 1
+            return
+
+        clipped_delta = float(np.clip(delta, -self.td_clip, self.td_clip))
+        if clipped_delta != delta:
+            self.stats["clipped_updates"] += 1
+
+        new_weights = self.weights + self.alpha * clipped_delta * phi
+        if not np.all(np.isfinite(new_weights)):
+            self.stats["skipped_updates"] += 1
+            return
+
+        self.weights = np.clip(new_weights, -self.weight_clip, self.weight_clip)
+
+    def is_healthy(self) -> bool:
+        return bool(np.all(np.isfinite(self.weights)))
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +329,7 @@ def train_mnk_agent(
         The trained agent.
     """
     game = MNKGame(n, n, k)
-    agent = MNKQLearningAgent(learning_rate=0.05, epsilon=0.3)
+    agent = MNKQLearningAgent(learning_rate=0.01, epsilon=0.3)
 
     print(f"Training MNK({n},{n},{k}) for {num_episodes:,} episodes")
     print("-" * 60)
@@ -290,7 +341,9 @@ def train_mnk_agent(
 
         if (episode + 1) % log_interval == 0:
             print(f"  Episode {episode + 1:,} / {num_episodes:,} | "
-                  f"Win rate: {agent.win_rate():.1%}")
+                  f"Win rate: {agent.win_rate():.1%} | "
+                  f"Clipped: {agent.stats['clipped_updates']:,} | "
+                  f"Skipped: {agent.stats['skipped_updates']:,}")
 
     path = os.path.join(save_dir, f"{name}_{n}x{n}_k{k}_trained.pkl")
     agent.save(path)

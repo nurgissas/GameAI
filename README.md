@@ -253,7 +253,31 @@ python experiments/test_adaptation.py --n 3 --k 3 --games 50
 
 Expected: player win rate near 50%, difficulty oscillating across middle levels.
 
-### 5. Optional analysis
+### 5. Play against the adaptive opponent
+
+Start a local browser-based playable MNK/Gomoku session:
+
+```bash
+python experiments/play_mnk.py 15 15 5
+```
+
+The three positional numbers are board width, board height, and the number of
+connected moves needed to win. If the matching trained model does not exist yet,
+the script trains one and saves it under `agents/` before opening the web UI.
+
+The right panel shows the current opponent difficulty. After each completed
+game, the player's moves are scored with the learned Q-value policy, the
+estimated player difficulty is updated, and the DDA controller selects the next
+opponent difficulty.
+
+Useful options:
+
+```bash
+python experiments/play_mnk.py 7 7 5 --episodes 10000
+python experiments/play_mnk.py 15 15 5 --port 9000 --no-open
+```
+
+### 6. Optional analysis
 
 ```bash
 python experiments/compare_rewards.py --n 3 --k 3        # ~5 min
