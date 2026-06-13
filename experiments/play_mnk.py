@@ -71,15 +71,21 @@ def train_rectangular_agent(
     k: int,
     episodes: int,
     save_path: Path,
+    use_tactical_rules: bool,
 ) -> None:
     """Train and save an MNKQLearningAgent for rectangular boards."""
     from envs.mnk_game import MNKGame
 
     game = MNKGame(height, width, k)
-    agent = MNKQLearningAgent(learning_rate=0.01, epsilon=0.3)
+    agent = MNKQLearningAgent(
+        learning_rate=0.01,
+        epsilon=0.3,
+        use_tactical_rules=use_tactical_rules,
+    )
     log_interval = max(episodes // 5, 1)
 
     print(f"Training MNK({height},{width},{k}) for {episodes:,} episodes")
+    print(f"Tactical rules: {'on' if use_tactical_rules else 'off'}")
     print("-" * 60)
     for episode in range(episodes):
         agent.epsilon = 0.3 - 0.25 * (episode / max(episodes, 1))
@@ -124,13 +130,15 @@ class PlaySession:
             min_epsilon=0.04,
         )
         self.history: list[dict] = []
+        self.ai_starts = False
+        self.manual_difficulty: int | None = None
         self.lock = threading.Lock()
         self.reset_match()
 
     def reset_match(self) -> None:
         state = self.metrics.state()
         self.current_state = state
-        self.difficulty = self.dda.select_difficulty(state)
+        self.difficulty = self._select_starting_difficulty(state)
         self.board = [[0] * self.width for _ in range(self.height)]
         self.moves = 0
         self.game_over = False
@@ -138,6 +146,8 @@ class PlaySession:
         self.player_estimates: list[float] = []
         self.player_qualities: list[float] = []
         self.last_update: dict | None = None
+        if self.ai_starts:
+            self._play_ai_turn()
 
     def snapshot(self) -> dict:
         eps = self.opponent_pool[self.difficulty].epsilon
@@ -158,6 +168,10 @@ class PlaySession:
             "lastUpdate": self.last_update,
             "history": self.history[-8:],
             "ddaEpsilon": self.dda.epsilon,
+            "aiStarts": self.ai_starts,
+            "manualDifficulty": (
+                None if self.manual_difficulty is None else self.manual_difficulty + 1
+            ),
         }
 
     def play_human_move(self, row: int, col: int) -> dict:
@@ -184,20 +198,45 @@ class PlaySession:
             if self._finish_if_terminal((row, col), PLAYER):
                 return {"ok": True, "state": self.snapshot()}
 
-            ai_move = self.opponent_pool[self.difficulty].choose_move(
-                self.board,
-                OPPONENT,
-                PLAYER,
-                self.k,
-            )
-            self._place(ai_move, OPPONENT)
-            self._finish_if_terminal(ai_move, OPPONENT)
+            ai_move = self._play_ai_turn()
             return {"ok": True, "aiMove": ai_move, "state": self.snapshot()}
 
     def next_game(self) -> dict:
         with self.lock:
             self.reset_match()
             return self.snapshot()
+
+    def set_ai_starts(self, ai_starts: bool) -> dict:
+        with self.lock:
+            self.ai_starts = ai_starts
+            self.reset_match()
+            return self.snapshot()
+
+    def set_difficulty(self, level: int | None) -> dict:
+        with self.lock:
+            if level is None:
+                self.manual_difficulty = None
+                self.difficulty = self.dda.select_difficulty(self.metrics.state())
+            else:
+                self.manual_difficulty = max(0, min(level - 1, len(self.opponent_pool) - 1))
+                self.difficulty = self.manual_difficulty
+            return self.snapshot()
+
+    def _select_starting_difficulty(self, state) -> int:
+        if self.manual_difficulty is not None:
+            return self.manual_difficulty
+        return self.dda.select_difficulty(state)
+
+    def _play_ai_turn(self) -> tuple[int, int]:
+        ai_move = self.opponent_pool[self.difficulty].choose_move(
+            self.board,
+            OPPONENT,
+            PLAYER,
+            self.k,
+        )
+        self._place(ai_move, OPPONENT)
+        self._finish_if_terminal(ai_move, OPPONENT)
+        return ai_move
 
     def _place(self, move: tuple[int, int], marker: int) -> None:
         row, col = move
@@ -356,6 +395,32 @@ HTML = """<!doctype html>
       cursor: pointer;
     }
     button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .controls {
+      display: grid;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    label.control {
+      display: grid;
+      gap: 4px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    select {
+      min-height: 36px;
+      border-radius: 6px;
+      border: 1px solid rgba(23,32,38,.18);
+      background: #fff;
+      padding: 0 8px;
+      color: var(--ink);
+    }
+    .toggle {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--ink);
+      font-size: 14px;
+    }
     #log {
       border-top: 1px solid rgba(23,32,38,.14);
       padding-top: 10px;
@@ -381,6 +446,16 @@ HTML = """<!doctype html>
       <div class="actions">
         <button class="action primary" id="next">Next game</button>
       </div>
+      <div class="controls">
+        <label class="toggle">
+          <input type="checkbox" id="aiFirst">
+          AI first
+        </label>
+        <label class="control">
+          Difficulty
+          <select id="difficulty"></select>
+        </label>
+      </div>
       <div class="metrics" id="metrics"></div>
       <div id="log"></div>
     </aside>
@@ -390,6 +465,8 @@ HTML = """<!doctype html>
     const boardEl = document.getElementById("board");
     const metricsEl = document.getElementById("metrics");
     const logEl = document.getElementById("log");
+    const aiFirstEl = document.getElementById("aiFirst");
+    const difficultyEl = document.getElementById("difficulty");
 
     async function api(path, body) {
       const res = await fetch(path, {
@@ -413,6 +490,17 @@ HTML = """<!doctype html>
 
     async function nextGame() {
       state = await api("/next", {});
+      render();
+    }
+
+    async function setAiFirst() {
+      state = await api("/ai-first", {aiFirst: aiFirstEl.checked});
+      render();
+    }
+
+    async function setDifficulty() {
+      const value = difficultyEl.value;
+      state = await api("/difficulty", {level: value === "auto" ? null : Number(value)});
       render();
     }
 
@@ -451,6 +539,8 @@ HTML = """<!doctype html>
       const est = state.estimatedDifficulty.toFixed(2);
       const quality = state.moveQuality.toFixed(2);
       const reward = state.lastUpdate ? state.lastUpdate.reward.toFixed(3) : "-";
+      renderDifficultySelect();
+      aiFirstEl.checked = state.aiStarts;
       metricsEl.innerHTML = [
         metric("Status", statusText()),
         metric("Board", `${state.width}x${state.height} / ${state.k}`),
@@ -474,7 +564,20 @@ HTML = """<!doctype html>
       logEl.innerHTML = lines.join("");
     }
 
+    function renderDifficultySelect() {
+      const selected = state.manualDifficulty === null ? "auto" : String(state.difficultyLevel);
+      const options = [`<option value="auto">Auto DDA</option>`];
+      for (let level = 1; level <= state.nLevels; level++) {
+        const label = `Level ${level}` + (level === state.difficultyLevel ? " (current)" : "");
+        options.push(`<option value="${level}">${label}</option>`);
+      }
+      difficultyEl.innerHTML = options.join("");
+      difficultyEl.value = selected;
+    }
+
     document.getElementById("next").onclick = nextGame;
+    aiFirstEl.onchange = setAiFirst;
+    difficultyEl.onchange = setDifficulty;
     load();
   </script>
 </body>
@@ -517,6 +620,13 @@ def make_handler(session: PlaySession):
             if parsed.path == "/next":
                 self._json(session.next_game())
                 return
+            if parsed.path == "/ai-first":
+                self._json(session.set_ai_starts(bool(body.get("aiFirst"))))
+                return
+            if parsed.path == "/difficulty":
+                level = body.get("level")
+                self._json(session.set_difficulty(None if level is None else int(level)))
+                return
             self.send_error(404)
 
         def log_message(self, fmt, *args):
@@ -534,6 +644,8 @@ def main() -> None:
     parser.add_argument("--levels", type=int, default=len(EPSILON_LEVELS), help="Number of difficulty levels")
     parser.add_argument("--port", type=int, default=8765, help="Local web server port")
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--force-train", action="store_true", help="Retrain even if a saved model exists")
+    parser.add_argument("--no-tactical-rules", action="store_true", help="Disable tactical rules during training and play")
     parser.add_argument("--no-open", action="store_true", help="Do not open the browser automatically")
     args = parser.parse_args()
 
@@ -541,7 +653,8 @@ def main() -> None:
         raise SystemExit("k must be achievable on the board.")
 
     path = model_path(args.width, args.height, args.k)
-    if not has_valid_model(path):
+    use_tactical_rules = not args.no_tactical_rules
+    if args.force_train or not has_valid_model(path):
         path.parent.mkdir(parents=True, exist_ok=True)
         if args.width == args.height:
             train_mnk_agent(
@@ -550,11 +663,23 @@ def main() -> None:
                 num_episodes=args.episodes,
                 save_dir=str(path.parent),
                 name="mnk",
+                use_tactical_rules=use_tactical_rules,
             )
         else:
-            train_rectangular_agent(args.width, args.height, args.k, args.episodes, path)
+            train_rectangular_agent(
+                args.width,
+                args.height,
+                args.k,
+                args.episodes,
+                path,
+                use_tactical_rules=use_tactical_rules,
+            )
 
-    pool = build_opponent_pool(str(path), num_levels=args.levels)
+    pool = build_opponent_pool(
+        str(path),
+        num_levels=args.levels,
+        use_tactical_rules=use_tactical_rules,
+    )
     session = PlaySession(args.width, args.height, args.k, pool, args.seed)
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(session))

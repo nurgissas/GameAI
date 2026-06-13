@@ -48,6 +48,7 @@ class MNKQLearningAgent:
         seed: int | None = None,
         td_clip: float = 5.0,
         weight_clip: float = 10.0,
+        use_tactical_rules: bool = True,
     ) -> None:
         self.weights = np.zeros(N_FEATURES, dtype=np.float64)
         self.alpha = learning_rate
@@ -55,6 +56,7 @@ class MNKQLearningAgent:
         self.epsilon = epsilon
         self.td_clip = td_clip
         self.weight_clip = weight_clip
+        self.use_tactical_rules = use_tactical_rules
         self._rng = random.Random(seed)
         self.stats = {
             "wins": 0,
@@ -93,10 +95,47 @@ class MNKQLearningAgent:
         if not moves:
             raise ValueError("choose_move called with no legal moves")
 
+        if self._should_use_tactical_rule():
+            own_winners = self._winning_moves(board, marker, k, moves)
+            if own_winners:
+                return self._best_q_move(board, own_winners, marker, enemy_marker, k)
+
+            enemy_winners = self._winning_moves(board, enemy_marker, k, moves)
+            if enemy_winners:
+                safe_blocks = self._moves_that_prevent_immediate_loss(
+                    board,
+                    moves,
+                    marker,
+                    enemy_marker,
+                    k,
+                )
+                defensive_moves = safe_blocks if safe_blocks else enemy_winners
+                return self._best_q_move(board, defensive_moves, marker, enemy_marker, k)
+
+            own_open_threat_moves = self._open_threat_blocks(
+                board,
+                marker,
+                k,
+                min_stones=max(1, k - 2),
+            )
+            legal_attacks = [move for move in own_open_threat_moves if move in moves]
+            if legal_attacks:
+                return self._best_q_move(board, legal_attacks, marker, enemy_marker, k)
+
+            enemy_open_threat_blocks = self._open_threat_blocks(
+                board,
+                enemy_marker,
+                k,
+                min_stones=max(1, k - 2),
+            )
+            legal_blocks = [move for move in enemy_open_threat_blocks if move in moves]
+            if legal_blocks:
+                return self._best_q_move(board, legal_blocks, marker, enemy_marker, k)
+
         if self._rng.random() < self.epsilon:
             return self._rng.choice(moves)
 
-        return max(moves, key=lambda m: self.q_value(board, m, marker, enemy_marker, k))
+        return self._best_q_move(board, moves, marker, enemy_marker, k)
 
     # ------------------------------------------------------------------
     # Training
@@ -206,6 +245,7 @@ class MNKQLearningAgent:
                     "gamma": self.gamma,
                     "td_clip": self.td_clip,
                     "weight_clip": self.weight_clip,
+                    "use_tactical_rules": self.use_tactical_rules,
                 },
                 f,
             )
@@ -224,6 +264,7 @@ class MNKQLearningAgent:
         )
         self.stats.setdefault("clipped_updates", 0)
         self.stats.setdefault("skipped_updates", 0)
+        self.use_tactical_rules = data.get("use_tactical_rules", self.use_tactical_rules)
         print(f"Loaded <- {path}")
 
     def win_rate(self) -> float:
@@ -259,6 +300,126 @@ class MNKQLearningAgent:
     def is_healthy(self) -> bool:
         return bool(np.all(np.isfinite(self.weights)))
 
+    def _should_use_tactical_rule(self) -> bool:
+        """Apply tactical guards with probability 1 - epsilon.
+
+        This keeps the same epsilon-based difficulty scale for immediate wins,
+        immediate blocks, and open-threat attack/defense.
+        """
+        return self.use_tactical_rules and self._rng.random() >= self.epsilon
+
+    def _best_q_move(
+        self,
+        board: list[list[int]],
+        moves: list[tuple[int, int]],
+        marker: int,
+        enemy_marker: int,
+        k: int,
+    ) -> tuple[int, int]:
+        return max(moves, key=lambda m: self.q_value(board, m, marker, enemy_marker, k))
+
+    def _winning_moves(
+        self,
+        board: list[list[int]],
+        marker: int,
+        k: int,
+        moves: list[tuple[int, int]],
+    ) -> list[tuple[int, int]]:
+        winners = []
+        m = len(board)
+        n = len(board[0])
+        for move in moves:
+            row, col = move
+            board[row][col] = marker
+            try:
+                if _check_winner(board, m, n, k, move, marker):
+                    winners.append(move)
+            finally:
+                board[row][col] = 0
+        return winners
+
+    def _moves_that_prevent_immediate_loss(
+        self,
+        board: list[list[int]],
+        moves: list[tuple[int, int]],
+        marker: int,
+        enemy_marker: int,
+        k: int,
+    ) -> list[tuple[int, int]]:
+        safe_moves = []
+        for move in moves:
+            row, col = move
+            board[row][col] = marker
+            try:
+                enemy_replies = legal_moves(board)
+                if not self._winning_moves(board, enemy_marker, k, enemy_replies):
+                    safe_moves.append(move)
+            finally:
+                board[row][col] = 0
+        return safe_moves
+
+    def _open_threat_blocks(
+        self,
+        board: list[list[int]],
+        marker: int,
+        k: int,
+        min_stones: int,
+    ) -> list[tuple[int, int]]:
+        """Return endpoints that block open runs of at least min_stones.
+
+        For Gomoku k=5, min_stones=3 captures open-three. This is intentionally
+        an inference-time safety rule, not a learned feature.
+        """
+        height = len(board)
+        width = len(board[0])
+        blocks = set()
+        directions = [(0, 1), (1, 0), (1, 1), (1, -1)]
+
+        for row in range(height):
+            for col in range(width):
+                if board[row][col] != marker:
+                    continue
+
+                for dr, dc in directions:
+                    prev_r = row - dr
+                    prev_c = col - dc
+                    if (
+                        0 <= prev_r < height
+                        and 0 <= prev_c < width
+                        and board[prev_r][prev_c] == marker
+                    ):
+                        continue
+
+                    run = 0
+                    r = row
+                    c = col
+                    while 0 <= r < height and 0 <= c < width and board[r][c] == marker:
+                        run += 1
+                        r += dr
+                        c += dc
+
+                    if run < min_stones or run >= k:
+                        continue
+
+                    before = (row - dr, col - dc)
+                    after = (r, c)
+                    before_open = (
+                        0 <= before[0] < height
+                        and 0 <= before[1] < width
+                        and board[before[0]][before[1]] == 0
+                    )
+                    after_open = (
+                        0 <= after[0] < height
+                        and 0 <= after[1] < width
+                        and board[after[0]][after[1]] == 0
+                    )
+
+                    if before_open and after_open:
+                        blocks.add(before)
+                        blocks.add(after)
+
+        return sorted(blocks)
+
 
 # ---------------------------------------------------------------------------
 # Epsilon-based difficulty pool
@@ -273,6 +434,7 @@ def build_opponent_pool(
     path: str,
     num_levels: int = 5,
     epsilon_levels: list[float] | None = None,
+    use_tactical_rules: bool | None = None,
 ) -> list[MNKQLearningAgent]:
     """
     Load one trained agent and return `num_levels` copies with decreasing
@@ -303,6 +465,8 @@ def build_opponent_pool(
         agent = MNKQLearningAgent()
         agent.load(path)
         agent.epsilon = eps
+        if use_tactical_rules is not None:
+            agent.use_tactical_rules = use_tactical_rules
         pool.append(agent)
     return pool
 
@@ -317,6 +481,7 @@ def train_mnk_agent(
     num_episodes: int = 30_000,
     save_dir: str = "agents",
     name: str = "mnk",
+    use_tactical_rules: bool = True,
 ) -> MNKQLearningAgent:
     """
     Train one agent to convergence and save it as a single .pkl file.
@@ -329,9 +494,14 @@ def train_mnk_agent(
         The trained agent.
     """
     game = MNKGame(n, n, k)
-    agent = MNKQLearningAgent(learning_rate=0.01, epsilon=0.3)
+    agent = MNKQLearningAgent(
+        learning_rate=0.01,
+        epsilon=0.3,
+        use_tactical_rules=use_tactical_rules,
+    )
 
     print(f"Training MNK({n},{n},{k}) for {num_episodes:,} episodes")
+    print(f"Tactical rules: {'on' if use_tactical_rules else 'off'}")
     print("-" * 60)
 
     log_interval = max(num_episodes // 5, 1)

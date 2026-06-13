@@ -25,6 +25,8 @@ def main():
                         help="Training episodes (default: 30000)")
     parser.add_argument("--save-dir", default="agents",
                         help="Directory for the saved model (default: agents)")
+    parser.add_argument("--no-tactical-rules", action="store_true",
+                        help="Disable tactical rules during training")
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
@@ -35,6 +37,7 @@ def main():
         num_episodes=args.episodes,
         save_dir=args.save_dir,
         name="mnk",
+        use_tactical_rules=not args.no_tactical_rules,
     )
 
 
