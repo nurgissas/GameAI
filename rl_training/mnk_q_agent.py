@@ -271,6 +271,20 @@ class MNKQLearningAgent:
         total = self.stats["wins"] + self.stats["losses"] + self.stats["draws"]
         return self.stats["wins"] / total if total > 0 else 0.0
 
+    def copy_for_play(self, epsilon: float | None = None) -> "MNKQLearningAgent":
+        """Return a frozen play-only copy of the current learned weights."""
+        clone = MNKQLearningAgent(
+            learning_rate=self.alpha,
+            discount_factor=self.gamma,
+            epsilon=self.epsilon if epsilon is None else epsilon,
+            td_clip=self.td_clip,
+            weight_clip=self.weight_clip,
+            use_tactical_rules=self.use_tactical_rules,
+        )
+        clone.weights = self.weights.copy()
+        clone.stats = self.stats.copy()
+        return clone
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -482,6 +496,7 @@ def train_mnk_agent(
     save_dir: str = "agents",
     name: str = "mnk",
     use_tactical_rules: bool = True,
+    opponent_strategy: str = "mixed",
 ) -> MNKQLearningAgent:
     """
     Train one agent to convergence and save it as a single .pkl file.
@@ -502,14 +517,27 @@ def train_mnk_agent(
 
     print(f"Training MNK({n},{n},{k}) for {num_episodes:,} episodes")
     print(f"Tactical rules: {'on' if use_tactical_rules else 'off'}")
+    print(f"Opponent strategy: {opponent_strategy}")
     print("-" * 60)
 
+    random_opponent = RandomPolicy()
+    opponent_snapshots: list[MNKQLearningAgent] = []
     log_interval = max(num_episodes // 5, 1)
     for episode in range(num_episodes):
         agent.epsilon = 0.3 - 0.25 * (episode / num_episodes)
-        agent.train_episode(game)
+        progress = episode / max(num_episodes, 1)
+        opponent = _training_opponent(
+            agent=agent,
+            random_opponent=random_opponent,
+            snapshots=opponent_snapshots,
+            progress=progress,
+            strategy=opponent_strategy,
+        )
+        agent.train_episode(game, opponent=opponent)
 
         if (episode + 1) % log_interval == 0:
+            opponent_snapshots.append(agent.copy_for_play(epsilon=0.05))
+            opponent_snapshots = opponent_snapshots[-4:]
             print(f"  Episode {episode + 1:,} / {num_episodes:,} | "
                   f"Win rate: {agent.win_rate():.1%} | "
                   f"Clipped: {agent.stats['clipped_updates']:,} | "
@@ -520,6 +548,43 @@ def train_mnk_agent(
     print("-" * 60)
     print(f"Done. Saved to {path}")
     return agent
+
+
+def _training_opponent(
+    agent: MNKQLearningAgent,
+    random_opponent: RandomPolicy,
+    snapshots: list[MNKQLearningAgent],
+    progress: float,
+    strategy: str,
+):
+    """Choose a training opponent for curriculum self-play.
+
+    random:
+        Always train against RandomPolicy.
+    self:
+        Train against a frozen copy of the current agent.
+    mixed:
+        Start with RandomPolicy, then mix random, current self-play, and older
+        snapshots so the agent sees both weak and increasingly competent play.
+    """
+    if strategy == "random":
+        return random_opponent
+
+    if strategy == "self":
+        return agent.copy_for_play(epsilon=max(0.05, agent.epsilon))
+
+    if strategy != "mixed":
+        raise ValueError(f"unknown opponent_strategy: {strategy}")
+
+    if progress < 0.20:
+        return random_opponent
+
+    roll = agent._rng.random()
+    if roll < 0.20:
+        return random_opponent
+    if roll < 0.65 or not snapshots:
+        return agent.copy_for_play(epsilon=max(0.05, agent.epsilon))
+    return agent._rng.choice(snapshots)
 
 
 # ---------------------------------------------------------------------------

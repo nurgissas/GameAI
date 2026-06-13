@@ -34,8 +34,10 @@ from rl_training.difficulty_scaling import (
 from rl_training.mnk_q_agent import (
     EPSILON_LEVELS,
     MNKQLearningAgent,
+    RandomPolicy,
     build_opponent_pool,
     train_mnk_agent,
+    _training_opponent,
 )
 
 
@@ -72,6 +74,7 @@ def train_rectangular_agent(
     episodes: int,
     save_path: Path,
     use_tactical_rules: bool,
+    opponent_strategy: str,
 ) -> None:
     """Train and save an MNKQLearningAgent for rectangular boards."""
     from envs.mnk_game import MNKGame
@@ -86,11 +89,24 @@ def train_rectangular_agent(
 
     print(f"Training MNK({height},{width},{k}) for {episodes:,} episodes")
     print(f"Tactical rules: {'on' if use_tactical_rules else 'off'}")
+    print(f"Opponent strategy: {opponent_strategy}")
     print("-" * 60)
+    random_opponent = RandomPolicy()
+    opponent_snapshots: list[MNKQLearningAgent] = []
     for episode in range(episodes):
         agent.epsilon = 0.3 - 0.25 * (episode / max(episodes, 1))
-        agent.train_episode(game)
+        progress = episode / max(episodes, 1)
+        opponent = _training_opponent(
+            agent=agent,
+            random_opponent=random_opponent,
+            snapshots=opponent_snapshots,
+            progress=progress,
+            strategy=opponent_strategy,
+        )
+        agent.train_episode(game, opponent=opponent)
         if (episode + 1) % log_interval == 0:
+            opponent_snapshots.append(agent.copy_for_play(epsilon=0.05))
+            opponent_snapshots = opponent_snapshots[-4:]
             print(
                 f"  Episode {episode + 1:,} / {episodes:,} | "
                 f"Win rate: {agent.win_rate():.1%} | "
@@ -646,6 +662,12 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--force-train", action="store_true", help="Retrain even if a saved model exists")
     parser.add_argument("--no-tactical-rules", action="store_true", help="Disable tactical rules during training and play")
+    parser.add_argument(
+        "--opponent-strategy",
+        choices=["mixed", "random", "self"],
+        default="mixed",
+        help="Training opponent curriculum used when training a new model",
+    )
     parser.add_argument("--no-open", action="store_true", help="Do not open the browser automatically")
     args = parser.parse_args()
 
@@ -664,6 +686,7 @@ def main() -> None:
                 save_dir=str(path.parent),
                 name="mnk",
                 use_tactical_rules=use_tactical_rules,
+                opponent_strategy=args.opponent_strategy,
             )
         else:
             train_rectangular_agent(
@@ -673,6 +696,7 @@ def main() -> None:
                 args.episodes,
                 path,
                 use_tactical_rules=use_tactical_rules,
+                opponent_strategy=args.opponent_strategy,
             )
 
     pool = build_opponent_pool(
