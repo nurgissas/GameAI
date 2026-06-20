@@ -67,6 +67,58 @@ For the move being evaluated, across each of 4 directions (row, column, diagonal
 
 ---
 
+## Move Selection: Tactical Rules Above Q-Values
+
+Pure linear FA learns long-range strategy well but can miss forced, single-move
+tactics — an immediate win, or blocking the opponent's immediate win. To fix this
+without abandoning learning, `choose_move` runs a short priority chain of
+inference-time tactical rules **before** falling back to the learned Q-values:
+
+1. Play an immediate winning move if one exists
+2. Otherwise block the opponent's immediate winning move (preferring a block that does not itself concede a win)
+3. Otherwise extend an own open threat of at least `k − 2` stones
+4. Otherwise block the opponent's open threat of at least `k − 2` stones
+5. Otherwise fall back to ε-greedy selection over the learned Q-values
+
+These rules are **not** learned features — they are deterministic checks computed
+from the board. To keep the difficulty gradient intact, the tactical layer only
+activates with probability `1 − ε`:
+
+- At Level 1 (ε = 1.00) the rules never fire — play is effectively random.
+- At Level 5 (ε = 0.00) the rules always fire — the agent never misses a forced win or block.
+
+So the same epsilon that controls exploration also controls how sharp the
+opponent's tactics are, which keeps the five difficulty levels monotonic.
+
+---
+
+## Training: Mixed Curriculum Self-Play
+
+Training only against a random opponent never exposes the agent to competent
+threats, so it never learns to defend. `train_mnk_agent` instead uses a mixed
+curriculum (`opponent_strategy="mixed"`, the default):
+
+- **First 20% of episodes:** play against a pure `RandomPolicy` to bootstrap basic play.
+- **Remaining episodes:** each game samples an opponent — roughly 20% random, 45% a frozen copy of the current agent (self-play), and the rest an older snapshot from earlier in training (last 4 snapshots retained).
+
+Epsilon decays linearly from 0.3 → 0.05 across training. The `random`
+(always random) and `self` (always self-play) strategies are also available via
+`--opponent-strategy`.
+
+---
+
+## Numerical Stability
+
+Linear FA with bootstrapped TD targets can diverge if a single update blows up.
+The agent guards against this:
+
+- **TD clipping:** the TD error δ is clipped to ±5 before the weight update.
+- **Weight clipping:** weights are clipped to ±10 after each update.
+- **NaN / inf guards:** any update producing a non-finite value is skipped; counts of clipped and skipped updates are tracked in `agent.stats`.
+- **Healthy-model guards:** `save()` refuses to write non-finite weights and `load()` rejects them; `play_mnk.py` deletes and retrains an invalid saved model automatically.
+
+---
+
 ## Difficulty Pool: Epsilon-Based Levels
 
 A naive approach would train 5 separate agents and use training snapshots as difficulty levels. This does not work reliably with linear FA because the weights converge early — empirically, win rate stops improving after ~2,000 episodes and remains flat through 50,000. Snapshot levels 1–5 end up nearly identical in strength.
@@ -144,16 +196,18 @@ Extracts the 18-dimensional feature vector `φ(board, move, marker, k)` from any
 
 | Interface | Description |
 |-----------|-------------|
-| `choose_move(board, marker, enemy, k)` | ε-greedy move selection |
+| `choose_move(board, marker, enemy, k)` | Tactical rules (win / block / threat) with prob. `1 − ε`, then ε-greedy over `w · φ` |
 | `q_value(board, move, marker, enemy, k)` | Returns `w · φ` |
-| `train_episode(game, opponent, rewards)` | Plays one game, updates weights |
-| `save(path)` / `load(path)` | Saves/loads the weight vector |
+| `train_episode(game, opponent, rewards)` | Plays one game, updates weights via clipped semi-gradient TD |
+| `copy_for_play(epsilon=None)` | Returns a frozen, play-only copy (used as a self-play opponent) |
+| `is_healthy()` | True if all weights are finite |
+| `save(path)` / `load(path)` | Saves/loads the weight vector (refuses non-finite weights) |
 
 Module-level functions:
 
 | Function | Description |
 |----------|-------------|
-| `train_mnk_agent(n, k, ...)` | Trains one agent to convergence, saves a single `*_trained.pkl` |
+| `train_mnk_agent(n, k, ..., opponent_strategy="mixed")` | Trains one agent to convergence, saves a single `*_trained.pkl` |
 | `build_opponent_pool(path, num_levels)` | Loads one model, returns list of agents with `EPSILON_LEVELS` |
 | `EPSILON_LEVELS` | `[1.0, 0.7, 0.4, 0.15, 0.0]` — epsilon per difficulty level |
 
@@ -288,7 +342,9 @@ python experiments/sensitivity_analysis.py --n 3 --k 3   # ~15 min
 
 ## Key Concepts
 
-**Linear Function Approximation** — Instead of storing Q-values per state, a weight vector `w` is learned such that `Q(s,a) ≈ w·φ(s,a)`. The feature vector `φ` encodes board structure (runs, threats, position) in a fixed 18 dimensions regardless of board size. Updated via semi-gradient TD.
+**Linear Function Approximation** — Instead of storing Q-values per state, a weight vector `w` is learned such that `Q(s,a) ≈ w·φ(s,a)`. The feature vector `φ` encodes board structure (runs, threats, position) in a fixed 18 dimensions regardless of board size. Updated via semi-gradient TD with TD/weight clipping for stability.
+
+**Tactical rule layer** — A deterministic safety net above the learned Q-values. Before consulting `w·φ`, the agent checks for forced moves (own win, block opponent win, extend/block an open threat). It fires only with probability `1 − ε`, so it sharpens the strong levels without flattening the easy ones — separating learned long-range strategy from obvious single-move tactics.
 
 **Epsilon-based difficulty pool** — A single trained agent is reused at multiple epsilon values to form the opponent pool. High epsilon means mostly random play (easy); epsilon=0 means fully greedy play (hard). This is more reliable than training snapshots because it guarantees a monotonic gradient independent of training dynamics.
 
@@ -306,11 +362,14 @@ python experiments/sensitivity_analysis.py --n 3 --k 3   # ~15 min
 |-----------|--------|
 | Generalized MNK game engine (any n, k) | Done |
 | Linear FA feature extractor (18-dim, board-size independent) | Done |
-| Linear FA agent with semi-gradient TD | Done |
+| Linear FA agent with clipped semi-gradient TD | Done |
+| Tactical rule layer (win / block / open-threat) | Done |
+| Mixed curriculum self-play training | Done |
 | Single-model training (`train_mnk_agent`) | Done |
 | Epsilon-based opponent pool (`build_opponent_pool`) | Done |
 | Rule-based meta-agent (DDA baseline) | Done |
 | RL DDA controller | Done |
+| Playable browser demo (`play_mnk.py`) | Done |
 | Evaluation and analysis scripts | Done |
 
 ---
