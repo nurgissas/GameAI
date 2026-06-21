@@ -79,7 +79,7 @@ adaptive_difficulty_rl/
 
 ```bash
 git clone git@github.com:nurgissas/GameAI.git
-cd GameAI/adaptive_difficulty_rl
+cd GameAI/
 python -m venv venv
 source venv/bin/activate        # Mac / Linux
 # venv\Scripts\activate         # Windows
