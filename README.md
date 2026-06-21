@@ -2,9 +2,9 @@
 
 Authors: Nurgissa Sailaubek, Youngjin Cho
 
-A two-stage game AI system that dynamically adjusts opponent difficulty in real time based on how well the player is actually playing — not just whether they win or lose. The system estimates player skill from the quality of their moves and uses a learned Q-Learning controller to decide when to increase, hold, or decrease difficulty.
+A two-stage game AI for online dynamic difficulty adjustment (DDA) in generalized MNK games. A board-playing agent learns to play via linear-function-approximation Q-learning; a separate Q-learning controller estimates player skill from move quality and decides when to raise, hold, or lower difficulty. Supports any m×n board with k-in-a-row to win — Tic-Tac-Toe is `MNKGame(3,3,3)`, Gomoku is `MNKGame(15,15,5)`.
 
-Supports any m×n board and k-in-a-row win condition. Tic-Tac-Toe is `MNKGame(3,3,3)`; Gomoku is `MNKGame(15,15,5)`.
+See the project report for the full method, equations, experiments, and analysis.
 
 ---
 
@@ -16,114 +16,23 @@ Player makes a move
 QValueDifficultyEstimator ranks that move against all legal moves
 using Q-values from the opponent pool → estimates player skill
         ↓
-QValueDDAMetrics tracks a sliding window of:
+QValueDDAMetrics tracks a sliding window:
   win rate · move quality · game duration · difficulty variance
         ↓
-QLearningDDA (RL meta-agent) selects action: [-1] down / [0] stay / [+1] up
+QLearningDDA (RL controller) selects: [-1] down / [0] stay / [+1] up
         ↓
-Next game uses the updated difficulty level
-        ↓
-DDA Q-table updates via Bellman equation using reward:
-  -(mismatch_error + duration_penalty + variance_penalty + switch_penalty)
+Next game uses the new difficulty level; the DDA Q-table updates from a
+reward penalizing skill mismatch, bad duration, variance, and switching
 ```
-
-The opponent pool contains N agents at discrete skill levels, built from a single trained model with varying epsilon values (see below). The DDA controller learns when switching difficulty actually helps maintain engagement, rather than following hard-coded rules.
 
 ---
 
-## Agent Design: Linear Function Approximation
+## Approach
 
-The opponent pool agents use **linear function approximation** instead of a Q-table.
-
-A Q-table stores one value per (board state, move) pair. For a 3×3 board this is manageable (~5,000 states), but for a 15×15 Gomoku board the state space is astronomically large — the table would never converge.
-
-Instead, each agent learns a single **weight vector** `w` of size 18:
-
-```
-Q(board, move) = w · φ(board, move)
-```
-
-`φ` is a fixed 18-dimensional feature vector extracted from any board position (see below). The weights are updated via semi-gradient TD at every agent turn:
-
-```
-δ = r + γ · max_a' Q(s', a') − Q(s, a)
-w += α · δ · φ(s, a)
-```
-
-This approach generalizes to any board size because the feature vector has **fixed dimension regardless of n or k**.
-
-### Feature Vector (18 dimensions)
-
-For the move being evaluated, across each of 4 directions (row, column, diagonal, anti-diagonal):
-
-| Features | Description |
-|----------|-------------|
-| 0–3   | My run length after placing ÷ k (clamped to 1) |
-| 4–7   | My open ends ÷ 2 |
-| 8–11  | Opponent pieces in forward direction ÷ k |
-| 12–15 | Opponent pieces in backward direction ÷ k |
-| 16    | Normalized distance from board center |
-| 17    | Board fill ratio |
-
----
-
-## Move Selection: Tactical Rules Above Q-Values
-
-Pure linear FA learns long-range strategy well but can miss forced, single-move
-tactics — an immediate win, or blocking the opponent's immediate win. To fix this
-without abandoning learning, `choose_move` runs a short priority chain of
-inference-time tactical rules **before** falling back to the learned Q-values:
-
-1. Play an immediate winning move if one exists
-2. Otherwise block the opponent's immediate winning move (preferring a block that does not itself concede a win)
-3. Otherwise extend an own open threat of at least `k − 2` stones
-4. Otherwise block the opponent's open threat of at least `k − 2` stones
-5. Otherwise fall back to ε-greedy selection over the learned Q-values
-
-These rules are **not** learned features — they are deterministic checks computed
-from the board. To keep the difficulty gradient intact, the tactical layer only
-activates with probability `1 − ε`:
-
-- At Level 1 (ε = 1.00) the rules never fire — play is effectively random.
-- At Level 5 (ε = 0.00) the rules always fire — the agent never misses a forced win or block.
-
-So the same epsilon that controls exploration also controls how sharp the
-opponent's tactics are, which keeps the five difficulty levels monotonic.
-
----
-
-## Training: Mixed Curriculum Self-Play
-
-Training only against a random opponent never exposes the agent to competent
-threats, so it never learns to defend. `train_mnk_agent` instead uses a mixed
-curriculum (`opponent_strategy="mixed"`, the default):
-
-- **First 20% of episodes:** play against a pure `RandomPolicy` to bootstrap basic play.
-- **Remaining episodes:** each game samples an opponent — roughly 20% random, 45% a frozen copy of the current agent (self-play), and the rest an older snapshot from earlier in training (last 4 snapshots retained).
-
-Epsilon decays linearly from 0.3 → 0.05 across training. The `random`
-(always random) and `self` (always self-play) strategies are also available via
-`--opponent-strategy`.
-
----
-
-## Numerical Stability
-
-Linear FA with bootstrapped TD targets can diverge if a single update blows up.
-The agent guards against this:
-
-- **TD clipping:** the TD error δ is clipped to ±5 before the weight update.
-- **Weight clipping:** weights are clipped to ±10 after each update.
-- **NaN / inf guards:** any update producing a non-finite value is skipped; counts of clipped and skipped updates are tracked in `agent.stats`.
-- **Healthy-model guards:** `save()` refuses to write non-finite weights and `load()` rejects them; `play_mnk.py` deletes and retrains an invalid saved model automatically.
-
----
-
-## Difficulty Pool: Epsilon-Based Levels
-
-A naive approach would train 5 separate agents and use training snapshots as difficulty levels. This does not work reliably with linear FA because the weights converge early — empirically, win rate stops improving after ~2,000 episodes and remains flat through 50,000. Snapshot levels 1–5 end up nearly identical in strength.
-
-Instead, **one fully-converged agent is trained**, and 5 difficulty levels are created at inference time by varying epsilon:
+- **Board-playing agent** — Linear function approximation `Q(s, a) = w · φ(s, a)` over an 18-dimensional feature vector, trained with semi-gradient TD. The fixed feature size works on any board dimension.
+- **Tactical rules** — Before using learned Q-values, `choose_move` checks forced moves (own win, block opponent win, extend/block an open threat), firing with probability `1 − ε` so the difficulty ordering is preserved.
+- **Mixed-curriculum training** — Starts against a random opponent, then blends random, self-play, and past snapshots so the agent learns to defend rather than only attack.
+- **Epsilon-based difficulty pool** — One trained model is reused at five exploration rates to form ordered opponent levels (more reliable than training snapshots, which converge to near-identical strength):
 
 | Level | Epsilon | Behavior |
 |-------|---------|----------|
@@ -133,19 +42,7 @@ Instead, **one fully-converged agent is trained**, and 5 difficulty levels are c
 | 4 | 0.15 | Nearly greedy |
 | 5 | 0.00 | Always picks the best move — hardest |
 
-This guarantees a **monotonic difficulty gradient by construction** — the gradient does not depend on when or how fast the weights converged during training.
-
-The pool is created by `build_opponent_pool(path)` in `mnk_q_agent.py`, which loads one `.pkl` file and returns 5 agent copies with the epsilon values above.
-
-Actual win rates measured against a random opponent (200 games per level, 3×3 board):
-
-```
-Level 1  ε=1.00   45.5%
-Level 2  ε=0.70   60.5%
-Level 3  ε=0.40   62.5%
-Level 4  ε=0.15   76.0%
-Level 5  ε=0.00   84.0%
-```
+- **DDA controller** — A separate tabular Q-learning agent keyed on bucketed `(skill, duration, variance, current level)`, with actions `{-1, 0, +1}`, learning when changing difficulty actually helps.
 
 ---
 
@@ -159,84 +56,20 @@ adaptive_difficulty_rl/
 ├── rl_training/
 │   ├── feature_extractor.py   # 18-dim feature vector for any board/move
 │   ├── mnk_q_agent.py         # Linear FA agent, train_mnk_agent, build_opponent_pool
-│   ├── train_base_agent.py    # CLI script: trains and saves one model
+│   ├── train_base_agent.py    # CLI: trains and saves one model
 │   ├── meta_agent.py          # Rule-based difficulty selector (baseline)
 │   └── difficulty_scaling.py  # RL-based DDA controller (main system)
 │
 ├── experiments/
 │   ├── evaluate_agent.py      # Win rate of each epsilon level vs random
 │   ├── test_adaptation.py     # End-to-end rule-based DDA simulation
-│   ├── compare_rewards.py     # Compares 4 reward formulations
+│   ├── play_mnk.py            # Browser-based playable demo with online DDA
+│   ├── compare_rewards.py     # Compares reward formulations
 │   └── sensitivity_analysis.py # Hyperparameter sweep (α, γ, ε)
 │
 ├── agents/                    # Saved .pkl files (one per board config)
 └── requirements.txt
 ```
-
----
-
-## Module Breakdown
-
-### `envs/mnk_game.py`
-
-Generalized game engine. `MNKGame(m, n, k)` runs games on any m×n board with k-in-a-row winning. Key exports:
-
-- `MNKGame` — runs a full game between two policies via `run_round()`
-- `RandomPolicy` — uniform-random baseline
-- `legal_moves(board)` — returns all empty cells
-- `_check_winner(board, m, n, k, last_move, marker)` — O(4k) win detection
-
-### `rl_training/feature_extractor.py`
-
-Extracts the 18-dimensional feature vector `φ(board, move, marker, k)` from any board position. Operates on the board state **before** the move is placed.
-
-### `rl_training/mnk_q_agent.py`
-
-`MNKQLearningAgent` — the linear FA game agent.
-
-| Interface | Description |
-|-----------|-------------|
-| `choose_move(board, marker, enemy, k)` | Tactical rules (win / block / threat) with prob. `1 − ε`, then ε-greedy over `w · φ` |
-| `q_value(board, move, marker, enemy, k)` | Returns `w · φ` |
-| `train_episode(game, opponent, rewards)` | Plays one game, updates weights via clipped semi-gradient TD |
-| `copy_for_play(epsilon=None)` | Returns a frozen, play-only copy (used as a self-play opponent) |
-| `is_healthy()` | True if all weights are finite |
-| `save(path)` / `load(path)` | Saves/loads the weight vector (refuses non-finite weights) |
-
-Module-level functions:
-
-| Function | Description |
-|----------|-------------|
-| `train_mnk_agent(n, k, ..., opponent_strategy="mixed")` | Trains one agent to convergence, saves a single `*_trained.pkl` |
-| `build_opponent_pool(path, num_levels)` | Loads one model, returns list of agents with `EPSILON_LEVELS` |
-| `EPSILON_LEVELS` | `[1.0, 0.7, 0.4, 0.15, 0.0]` — epsilon per difficulty level |
-
-### `rl_training/train_base_agent.py`
-
-CLI wrapper around `train_mnk_agent`. Trains one agent and saves a single file:
-`agents/mnk_{n}x{n}_k{k}_trained.pkl`
-
-### `rl_training/difficulty_scaling.py`
-
-The main RL-based DDA system. Three components:
-
-**`QValueDifficultyEstimator`** — Measures move quality by ranking the player's actual move against every legal move using Q-values from the opponent pool. A move that scores in the 75th percentile across all levels → estimated player skill ≈ 3.0.
-
-**`QValueDDAMetrics`** — Sliding window tracker (default: last 20 games) for win rate, move quality, game duration, and difficulty estimate variance. Computes the reward signal after each game:
-```
-reward = -(
-    q_match_weight     × |opponent_difficulty − estimated_player_skill|
-  + duration_weight    × |game_duration − target_duration|
-  + variance_weight    × Var(recent_estimated_difficulty)
-  + switch_weight      × I[difficulty changed this episode]
-)
-```
-
-**`QLearningDDA`** — RL meta-agent with its own Q-table keyed on a 4-tuple state `(skill_bucket, duration_bucket, variance_bucket, current_level)`. Actions: `{-1, 0, +1}`. ε-greedy with decay (0.25 → 0.04).
-
-### `rl_training/meta_agent.py`
-
-Rule-based baseline DDA controller. Adjusts difficulty up/down based on win rate over a sliding window of 5 games. No learning — used as a comparison baseline against `QLearningDDA`.
 
 ---
 
@@ -261,43 +94,22 @@ Trains one agent to convergence and saves a single model file.
 # 3×3 Tic-Tac-Toe
 python rl_training/train_base_agent.py --n 3 --k 3
 
-# 5×5 board, k=4
-python rl_training/train_base_agent.py --n 5 --k 4 --episodes 60000
+# 7×7 board, k=5
+python rl_training/train_base_agent.py --n 7 --k 5 --episodes 10000
 
 # 15×15 Gomoku
 python rl_training/train_base_agent.py --n 15 --k 5 --episodes 200000
 ```
 
-Expected output:
-```
-Training MNK(3,3,3) for 30,000 episodes
-------------------------------------------------------------
-  Episode 6,000 / 30,000 | Win rate: 64.7%
-  Episode 12,000 / 30,000 | Win rate: 66.3%
-  ...
-Saved -> agents/mnk_3x3_k3_trained.pkl  (non-zero weights: 18)
-------------------------------------------------------------
-Done. Saved to agents/mnk_3x3_k3_trained.pkl
-```
-
-This produces **one file**: `agents/mnk_{n}x{n}_k{k}_trained.pkl`. The 5 difficulty levels are created from this single file at runtime by `build_opponent_pool()`.
+This produces one file: `agents/mnk_{n}x{n}_k{k}_trained.pkl`. The 5 difficulty levels are created from this single file at runtime by `build_opponent_pool()`.
 
 ### 3. Verify the difficulty gradient
 
 ```bash
-python experiments/evaluate_agent.py --n 3 --k 3
+python experiments/evaluate_agent.py --n 7 --k 5 --games 200
 ```
 
-Expected output:
-```
-Level    Epsilon    Win Rate
------------------------------------
-  1      ε=1.00     ~45%
-  2      ε=0.70     ~60%
-  3      ε=0.40     ~63%
-  4      ε=0.15     ~76%
-  5      ε=0.00     ~84%
-```
+Win rate against a random opponent increases monotonically from level 1 to level 5. See the project report's 7×7 benchmark for the measured figures.
 
 ### 4. Test the rule-based adaptive system
 
@@ -337,40 +149,6 @@ python experiments/play_mnk.py 15 15 5 --port 9000 --no-open
 python experiments/compare_rewards.py --n 3 --k 3        # ~5 min
 python experiments/sensitivity_analysis.py --n 3 --k 3   # ~15 min
 ```
-
----
-
-## Key Concepts
-
-**Linear Function Approximation** — Instead of storing Q-values per state, a weight vector `w` is learned such that `Q(s,a) ≈ w·φ(s,a)`. The feature vector `φ` encodes board structure (runs, threats, position) in a fixed 18 dimensions regardless of board size. Updated via semi-gradient TD with TD/weight clipping for stability.
-
-**Tactical rule layer** — A deterministic safety net above the learned Q-values. Before consulting `w·φ`, the agent checks for forced moves (own win, block opponent win, extend/block an open threat). It fires only with probability `1 − ε`, so it sharpens the strong levels without flattening the easy ones — separating learned long-range strategy from obvious single-move tactics.
-
-**Epsilon-based difficulty pool** — A single trained agent is reused at multiple epsilon values to form the opponent pool. High epsilon means mostly random play (easy); epsilon=0 means fully greedy play (hard). This is more reliable than training snapshots because it guarantees a monotonic gradient independent of training dynamics.
-
-**Q-Learning (DDA controller)** — A second, separate Q-table that learns when to change difficulty. Its state is a 4-tuple of bucketed metrics; its actions are `{-1, 0, +1}`. It learns that unnecessary switches are costly (switch penalty) and that matching opponent skill to player skill is the primary goal (mismatch penalty).
-
-**Move quality estimation** — Instead of only asking "did the player win?", the system asks "how good was the player's move?" by comparing it against all legal options using the opponent pool's Q-values. This gives a continuous skill signal within each game, not just at the end.
-
-**Reward design** — The DDA reward deliberately avoids directly rewarding 50% win rate. Instead it penalizes the gap between estimated player skill and current opponent difficulty. The theory is that matched difficulty naturally produces balanced outcomes without overfitting to win rate as a metric.
-
----
-
-## Implementation Status
-
-| Component | Status |
-|-----------|--------|
-| Generalized MNK game engine (any n, k) | Done |
-| Linear FA feature extractor (18-dim, board-size independent) | Done |
-| Linear FA agent with clipped semi-gradient TD | Done |
-| Tactical rule layer (win / block / open-threat) | Done |
-| Mixed curriculum self-play training | Done |
-| Single-model training (`train_mnk_agent`) | Done |
-| Epsilon-based opponent pool (`build_opponent_pool`) | Done |
-| Rule-based meta-agent (DDA baseline) | Done |
-| RL DDA controller | Done |
-| Playable browser demo (`play_mnk.py`) | Done |
-| Evaluation and analysis scripts | Done |
 
 ---
 
